@@ -2,13 +2,7 @@
 #include "pose_estimation.hpp"
 #include <apriltag_msgs/msg/april_tag_detection.hpp>
 #include <apriltag_msgs/msg/april_tag_detection_array.hpp>
-#ifdef cv_bridge_HPP
-#include <cv_bridge/cv_bridge.hpp>
-#else
 #include <cv_bridge/cv_bridge.h>
-#endif
-#include <image_transport/camera_subscriber.hpp>
-#include <image_transport/image_transport.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -75,16 +69,19 @@ private:
     std::atomic<bool> profile;
     std::unordered_map<int, std::string> tag_frames;
     std::unordered_map<int, double> tag_sizes;
+    std::array<double, 4> intrinsics;
 
     std::function<void(apriltag_family_t*)> tf_destructor;
 
-    const image_transport::CameraSubscriber sub_cam;
+    const rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_cam;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_cam_info;
     const rclcpp::Publisher<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr pub_detections;
     tf2_ros::TransformBroadcaster tf_broadcaster;
 
     pose_estimation_f estimate_pose = nullptr;
 
-    void onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img, const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci);
+    void onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img);
+    void onCameraInfo(const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci);
 
     rcl_interfaces::msg::SetParametersResult onParameter(const std::vector<rclcpp::Parameter>& parameters);
 };
@@ -97,8 +94,10 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     // parameter
     cb_parameter(add_on_set_parameters_callback(std::bind(&AprilTagNode::onParameter, this, std::placeholders::_1))),
     td(apriltag_detector_create()),
-    // topics
-    sub_cam(image_transport::create_camera_subscription(this, "image_rect", std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1, std::placeholders::_2), declare_parameter("image_transport", "raw", descr({}, true)), rmw_qos_profile_sensor_data)),
+
+    sub_cam(create_subscription<sensor_msgs::msg::Image>("image_rect", rclcpp::QoS(1), std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1))),
+    sub_cam_info(create_subscription<sensor_msgs::msg::CameraInfo>("camera_info", rclcpp::QoS(1), std::bind(&AprilTagNode::onCameraInfo, this, std::placeholders::_1))),
+ 
     pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
     tf_broadcaster(this)
 {
@@ -156,12 +155,8 @@ AprilTagNode::~AprilTagNode()
     tf_destructor(tf);
 }
 
-void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img,
-                            const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci)
+void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img)
 {
-    // camera intrinsics for rectified images
-    const std::array<double, 4> intrinsics = {msg_ci->p.data()[0], msg_ci->p.data()[5], msg_ci->p.data()[2], msg_ci->p.data()[6]};
-
     // convert to 8bit monochrome image
     const cv::Mat img_uint8 = cv_bridge::toCvShare(msg_img, "mono8")->image;
 
@@ -214,7 +209,7 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
         tf.child_frame_id = tag_frames.count(det->id) ? tag_frames.at(det->id) : std::string(det->family->name) + ":" + std::to_string(det->id);
         const double size = tag_sizes.count(det->id) ? tag_sizes.at(det->id) : tag_edge_size;
         if(estimate_pose != nullptr) {
-            tf.transform = estimate_pose(det, intrinsics, size);
+            tf.transform = estimate_pose(det, this->intrinsics, size);
         }
 
         tfs.push_back(tf);
@@ -224,6 +219,16 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
     tf_broadcaster.sendTransform(tfs);
 
     apriltag_detections_destroy(detections);
+}
+
+void AprilTagNode::onCameraInfo(const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci)
+{
+    mutex.lock();
+    intrinsics = {msg_ci->p[0], msg_ci->p[5], msg_ci->p[2], msg_ci->p[6]};
+    mutex.unlock();
+
+    RCLCPP_DEBUG(get_logger(), "camera intrinsics: %f %f %f %f", intrinsics[0], intrinsics[1], intrinsics[2], intrinsics[3]);
+    this->sub_cam_info.reset();
 }
 
 rcl_interfaces::msg::SetParametersResult
