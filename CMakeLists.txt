@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-project(apriltag_ros)
+project(apriltag_sc_ros)
 
 set(CMAKE_CXX_STANDARD 14)
 
